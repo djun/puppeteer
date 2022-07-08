@@ -1354,7 +1354,7 @@ export class Page extends EventEmitter {
         `Blank page can not have cookie "${item.name}"`
       );
       assert(
-        !String.prototype.startsWith.call(item.url || '', 'data:'),
+        !(item.url ?? '').startsWith('data:'),
         `Data URL page can not have cookie "${item.name}"`
       );
       return item;

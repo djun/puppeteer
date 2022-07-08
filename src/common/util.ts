@@ -523,3 +523,41 @@ export function isErrnoException(obj: unknown): obj is NodeJS.ErrnoException {
     ('errno' in obj || 'code' in obj || 'path' in obj || 'syscall' in obj)
   );
 }
+
+/**
+ * @internal
+ */
+export const noop = (): void => {};
+
+/**
+ * @internal
+ */
+export interface TimeoutPromise extends Promise<TimeoutError | void> {
+  clear(): void;
+}
+
+/**
+ * @internal
+ */
+export const createTimeoutPromise = (timeout?: number): TimeoutPromise => {
+  let clear: () => void = noop;
+  let promise: Promise<TimeoutError | void>;
+  if (timeout) {
+    promise = new Promise<TimeoutError | void>(resolve => {
+      const timer = setTimeout(() => {
+        resolve(new TimeoutError(`Exceeded ${timeout}ms`));
+      }, timeout);
+      clear = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+  } else {
+    promise = new Promise<TimeoutError | void>(resolve => {
+      clear = () => {
+        resolve();
+      };
+    });
+  }
+  return Object.assign(promise, {clear});
+};

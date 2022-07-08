@@ -24,6 +24,7 @@ import {EVALUATION_SCRIPT_URL, ExecutionContext} from './ExecutionContext.js';
 import {HTTPResponse} from './HTTPResponse.js';
 import {MouseButton} from './Input.js';
 import {LifecycleWatcher, PuppeteerLifeCycleEvent} from './LifecycleWatcher.js';
+import {NavigationWatcher} from './NavigationWatcher.js';
 import {NetworkManager} from './NetworkManager.js';
 import {Page} from './Page.js';
 import {TimeoutSettings} from './TimeoutSettings.js';
@@ -41,12 +42,12 @@ const UTILITY_WORLD_NAME = '__puppeteer_utility_world__';
 export const FrameManagerEmittedEvents = {
   FrameAttached: Symbol('FrameManager.FrameAttached'),
   FrameNavigated: Symbol('FrameManager.FrameNavigated'),
-  FrameDetached: Symbol('FrameManager.FrameDetached'),
-  FrameSwapped: Symbol('FrameManager.FrameSwapped'),
-  LifecycleEvent: Symbol('FrameManager.LifecycleEvent'),
   FrameNavigatedWithinDocument: Symbol(
     'FrameManager.FrameNavigatedWithinDocument'
   ),
+  FrameDetached: Symbol('FrameManager.FrameDetached'),
+  FrameSwapped: Symbol('FrameManager.FrameSwapped'),
+  LifecycleEvent: Symbol('FrameManager.LifecycleEvent'),
   ExecutionContextCreated: Symbol('FrameManager.ExecutionContextCreated'),
   ExecutionContextDestroyed: Symbol('FrameManager.ExecutionContextDestroyed'),
 };
@@ -190,78 +191,76 @@ export class FrameManager extends EventEmitter {
       waitUntil?: PuppeteerLifeCycleEvent | PuppeteerLifeCycleEvent[];
     } = {}
   ): Promise<HTTPResponse | null> {
-    assertNoLegacyNavigationOptions(options);
     const {
       referer = this.#networkManager.extraHTTPHeaders()['referer'],
-      waitUntil = ['load'],
-      timeout = this.#timeoutSettings.navigationTimeout(),
+      waitUntil,
+      timeout,
     } = options;
-
-    const watcher = new LifecycleWatcher(this, frame, waitUntil, timeout);
-    let error = await Promise.race([
-      navigate(this.#client, url, referer, frame._id),
-      watcher.timeoutOrTerminationPromise(),
-    ]);
-    if (!error) {
-      error = await Promise.race([
-        watcher.timeoutOrTerminationPromise(),
-        watcher.newDocumentNavigationPromise(),
-        watcher.sameDocumentNavigationPromise(),
-      ]);
-    }
-    watcher.dispose();
-    if (error) {
-      throw error;
-    }
-    return await watcher.navigationResponse();
-
-    async function navigate(
-      client: CDPSession,
-      url: string,
-      referrer: string | undefined,
-      frameId: string
-    ): Promise<Error | null> {
-      try {
-        const response = await client.send('Page.navigate', {
-          url,
-          referrer,
-          frameId,
-        });
-        return response.errorText
-          ? new Error(`${response.errorText} at ${url}`)
-          : null;
-      } catch (error) {
-        if (isErrorLike(error)) {
-          return error;
-        }
-        throw error;
-      }
-    }
+    await this.#navigate(url, referer, frame._id);
+    return await this.waitForFrameNavigation(frame, {
+      fromGoto: true,
+      waitUntil,
+      timeout,
+    });
   }
 
   async waitForFrameNavigation(
     frame: Frame,
     options: {
+      fromGoto?: boolean;
       timeout?: number;
       waitUntil?: PuppeteerLifeCycleEvent | PuppeteerLifeCycleEvent[];
     } = {}
   ): Promise<HTTPResponse | null> {
-    assertNoLegacyNavigationOptions(options);
     const {
+      fromGoto = false,
       waitUntil = ['load'],
       timeout = this.#timeoutSettings.navigationTimeout(),
     } = options;
-    const watcher = new LifecycleWatcher(this, frame, waitUntil, timeout);
-    const error = await Promise.race([
-      watcher.timeoutOrTerminationPromise(),
-      watcher.sameDocumentNavigationPromise(),
-      watcher.newDocumentNavigationPromise(),
-    ]);
-    watcher.dispose();
-    if (error) {
+
+    let response: HTTPResponse | null;
+    const navigationWatcher = new NavigationWatcher(
+      this,
+      frame,
+      timeout,
+      fromGoto
+    );
+    try {
+      response = await navigationWatcher.response();
+    } catch (error) {
+      navigationWatcher.terminate();
       throw error;
     }
-    return await watcher.navigationResponse();
+
+    const lifecycleWatcher = new LifecycleWatcher(
+      this,
+      frame,
+      timeout,
+      waitUntil
+    );
+    try {
+      await lifecycleWatcher.waitForCompletion();
+      return response;
+    } catch (error) {
+      lifecycleWatcher.terminate();
+      throw error;
+    }
+  }
+
+  async #navigate(
+    url: string,
+    referrer: string | undefined,
+    frameId: string
+  ): Promise<string | undefined> {
+    const {errorText, loaderId} = await this.#client.send('Page.navigate', {
+      url,
+      referrer,
+      frameId,
+    });
+    if (errorText) {
+      throw new Error(`${errorText} at ${url}`);
+    }
+    return loaderId;
   }
 
   async #onAttachedToTarget(event: Protocol.Target.AttachedToTargetEvent) {
@@ -362,12 +361,12 @@ export class FrameManager extends EventEmitter {
     frameId: string,
     parentFrameId?: string
   ): void {
-    if (this.#frames.has(frameId)) {
-      const frame = this.#frames.get(frameId)!;
-      if (session && frame.isOOPFrame()) {
-        // If an OOP iframes becomes a normal iframe again
-        // it is first attached to the parent page before
-        // the target is removed.
+    const frame = this.#frames.get(frameId)!;
+    if (frame) {
+      // If an OOP iframes becomes a normal iframe again
+      // it is first attached to the parent page before
+      // the target is removed.
+      if (frame.isOOPFrame()) {
         frame._updateClient(session);
       }
       return;
@@ -375,46 +374,35 @@ export class FrameManager extends EventEmitter {
     assert(parentFrameId);
     const parentFrame = this.#frames.get(parentFrameId);
     assert(parentFrame);
-    const frame = new Frame(this, parentFrame, frameId, session);
-    this.#frames.set(frame._id, frame);
-    this.emit(FrameManagerEmittedEvents.FrameAttached, frame);
+    const childFrame = new Frame(this, parentFrame, frameId, session);
+    this.#frames.set(childFrame._id, childFrame);
+    this.emit(FrameManagerEmittedEvents.FrameAttached, childFrame);
   }
 
   #onFrameNavigated(framePayload: Protocol.Page.Frame): void {
-    const isMainFrame = !framePayload.parentId;
-    let frame = isMainFrame
-      ? this.#mainFrame
-      : this.#frames.get(framePayload.id);
-    assert(
-      isMainFrame || frame,
-      'We either navigate top level or have old version of the navigated frame'
-    );
-
-    // Detach all child frames first.
-    if (frame) {
-      for (const child of frame.childFrames()) {
-        this.#removeFramesRecursively(child);
-      }
-    }
-
-    // Update or create main frame.
-    if (isMainFrame) {
-      if (frame) {
-        // Update frame id to retain frame identity on cross-process navigation.
-        this.#frames.delete(frame._id);
-        frame._id = framePayload.id;
+    if (!framePayload.parentId) {
+      // Update or create main frame.
+      if (this.#mainFrame) {
+        // Update main frame to retain frame identity on cross-process navigation.
+        this.#frames.delete(this.#mainFrame._id);
+        this.#mainFrame._id = framePayload.id;
       } else {
         // Initial main frame navigation.
-        frame = new Frame(this, null, framePayload.id, this.#client);
+        this.#mainFrame = new Frame(this, null, framePayload.id, this.#client);
       }
-      this.#frames.set(framePayload.id, frame);
-      this.#mainFrame = frame;
+      this.#frames.set(framePayload.id, this.#mainFrame);
+    }
+    const frame = this.#frames.get(framePayload.id);
+    assert(
+      frame,
+      'We either navigate top level or have old version of the navigated frame'
+    );
+    for (const child of frame.childFrames()) {
+      this.#removeFramesRecursively(child);
     }
 
-    // Update frame payload.
-    assert(frame);
-    frame._navigated(framePayload);
-
+    // Update frame.
+    frame.navigated(framePayload);
     this.emit(FrameManagerEmittedEvents.FrameNavigated, frame);
   }
 
@@ -452,9 +440,8 @@ export class FrameManager extends EventEmitter {
     if (!frame) {
       return;
     }
-    frame._navigatedWithinDocument(url);
+    frame.setUrl(url);
     this.emit(FrameManagerEmittedEvents.FrameNavigatedWithinDocument, frame);
-    this.emit(FrameManagerEmittedEvents.FrameNavigated, frame);
   }
 
   #onFrameDetached(
@@ -462,15 +449,18 @@ export class FrameManager extends EventEmitter {
     reason: Protocol.Page.FrameDetachedEventReason
   ): void {
     const frame = this.#frames.get(frameId);
-    if (reason === 'remove') {
-      // Only remove the frame if the reason for the detached event is
-      // an actual removement of the frame.
-      // For frames that become OOP iframes, the reason would be 'swap'.
-      if (frame) {
-        this.#removeFramesRecursively(frame);
-      }
-    } else if (reason === 'swap') {
-      this.emit(FrameManagerEmittedEvents.FrameSwapped, frame);
+    if (!frame) {
+      return;
+    }
+    switch (reason) {
+      case Protocol.Page.FrameDetachedEventReason.Remove:
+        frame._detach();
+        this.#frames.delete(frame._id);
+        this.emit(FrameManagerEmittedEvents.FrameDetached, frame);
+        break;
+      case Protocol.Page.FrameDetachedEventReason.Swap:
+        this.emit(FrameManagerEmittedEvents.FrameSwapped, frame);
+        break;
     }
   }
 
@@ -1410,15 +1400,15 @@ export class Frame {
   /**
    * @internal
    */
-  _navigated(framePayload: Protocol.Page.Frame): void {
+  navigated(framePayload: Protocol.Page.Frame): void {
     this._name = framePayload.name;
-    this.#url = `${framePayload.url}${framePayload.urlFragment || ''}`;
+    this.setUrl(`${framePayload.url}${framePayload.urlFragment || ''}`);
   }
 
   /**
    * @internal
    */
-  _navigatedWithinDocument(url: string): void {
+  setUrl(url: string): void {
     this.#url = url;
   }
 
@@ -1437,8 +1427,8 @@ export class Frame {
    * @internal
    */
   _onLoadingStopped(): void {
-    this._lifecycleEvents.add('DOMContentLoaded');
     this._lifecycleEvents.add('load');
+    this._lifecycleEvents.add('DOMContentLoaded');
   }
 
   /**
@@ -1460,21 +1450,4 @@ export class Frame {
     }
     this.#parentFrame = null;
   }
-}
-
-function assertNoLegacyNavigationOptions(options: {
-  [optionName: string]: unknown;
-}): void {
-  assert(
-    options['networkIdleTimeout'] === undefined,
-    'ERROR: networkIdleTimeout option is no longer supported.'
-  );
-  assert(
-    options['networkIdleInflight'] === undefined,
-    'ERROR: networkIdleInflight option is no longer supported.'
-  );
-  assert(
-    options['waitUntil'] !== 'networkidle',
-    'ERROR: "networkidle" option is no longer supported. Use "networkidle2" instead'
-  );
 }
